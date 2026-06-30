@@ -1,0 +1,9 @@
+{
+  "token": "8695038537:AAH1s5XvN49Bafmjl-NMHNU-wcznVnh_gKI",
+  "broadcast": {
+    "enabled": true,
+    "text": "Бебра",
+    "interval_seconds": 1800,
+    "chat_id": -1004328244105
+  }
+}
