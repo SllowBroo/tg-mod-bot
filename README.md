@@ -1,4 +1,28 @@
-# Telegram-бот для группового чата
+# Telegram Group Bot
+
+<div align="center">
+
+**Production-ready Telegram moderation bot for group communities**
+
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![aiogram](https://img.shields.io/badge/aiogram-3.x-2AABEE?logo=telegram&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-WAL--enabled-003B57?logo=sqlite&logoColor=white)
+![APScheduler](https://img.shields.io/badge/APScheduler-scheduled%20jobs-4B8BBE)
+
+</div>
+
+Telegram-бот для групповых чатов с рекламной рассылкой, приветствиями, быстрыми ответами и полноценной модерацией. Проект создан с фокусом на безопасное хранение настроек, предсказуемое поведение и устойчивую работу 24/7.
+
+## Что умеет бот
+
+| Модуль | Возможности |
+| --- | --- |
+| Реклама | Текст, фото, HTML-подпись, ссылки, ручная и интервальная отправка |
+| Приветствия | Только новые участники, HTML и шаблоны имени/упоминания |
+| Быстрые ответы | Настраиваемые ответы `купить дзо` и `купить мс` |
+| Модерация | Бан, разбан, мут, размут, предупреждения и автобан после 3 нарушений |
+| Безопасность | Команды только с `!`, проверка прав, rate limit, маскирование секретов |
+| Надёжность | Автоперезапуск polling, SQLite WAL и защита от дублей планировщика |
 
 Готовый бот на Python 3.11+, aiogram 3.x, SQLite и APScheduler. Он поддерживает рекламную рассылку, приветствия, быстрые ответы и модерацию. Все пользовательские команды начинаются с `!`; на обычные сообщения бот не отвечает.
 
