@@ -1049,30 +1049,82 @@ def plain_emoji_text(text):
     return _TG_EMOJI_RE.sub(r"\1", text) if text else text
 
 
+_BUTTON_ICON_REJECTED = False   # Telegram уже отклонял иконку на кнопке
+
+
+def _markup_has_icons(markup) -> bool:
+    return isinstance(markup, InlineKeyboardMarkup) and any(
+        getattr(b, "icon_custom_emoji_id", None) for row in markup.inline_keyboard for b in row
+    )
+
+
+def strip_button_icons(markup):
+    """ Та же клавиатура, но без icon_custom_emoji_id на кнопках. """
+    if not _markup_has_icons(markup):
+        return markup
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b.model_copy(update={"icon_custom_emoji_id": None}) for b in row]
+        for row in markup.inline_keyboard
+    ])
+
+
 async def emoji_fallback_middleware(make_request, bot, method):
-    """ Middleware сессии бота: если Telegram отклонил сообщение с кастомным
-        эмодзи (TelegramBadRequest), тот же запрос повторяется с обычным 🪙.
-        Повторяется только отправка, начисления и кулдауны уже записаны и
-        второй раз не выполняются. После первого отказа кастомный эмодзи
-        дальше сразу заменяется, чтобы не делать лишних запросов.
-        Покрывает поля text (sendMessage, editMessageText) и caption (sendPhoto,
-        editMessageCaption и др.), то есть все сообщения бота, включая рекламу. """
-    global _CUSTOM_EMOJI_REJECTED
-    update = {}
+    """ Middleware сессии бота: запасной путь для кастомных эмодзи.
+        1) <tg-emoji> в полях text (sendMessage, editMessageText) и caption
+           (sendPhoto, editMessageCaption и др.), включая рекламу;
+        2) иконка icon_custom_emoji_id на inline-кнопках с ценой.
+        Если Telegram отклонил запрос (TelegramBadRequest), он повторяется
+        сначала без иконок на кнопках, потом с обычным 🪙 в тексте, потом без
+        того и другого. Что именно пришлось убрать, запоминается до перезапуска,
+        и дальше это убирается сразу, без лишних запросов. Повторяется только
+        отправка: начисления, кулдауны и заморозки уже записаны и второй раз
+        не выполняются. """
+    global _CUSTOM_EMOJI_REJECTED, _BUTTON_ICON_REJECTED
+    text_update = {}
     for field in _EMOJI_FIELDS:
         value = getattr(method, field, None)
         if isinstance(value, str) and "<tg-emoji" in value:
-            update[field] = plain_emoji_text(value)
-    if not update:
+            text_update[field] = plain_emoji_text(value)
+    markup = getattr(method, "reply_markup", None)
+    has_icons = _markup_has_icons(markup)
+    if not text_update and not has_icons:
         return await make_request(bot, method)
-    if _CUSTOM_EMOJI_REJECTED:
-        return await make_request(bot, method.model_copy(update=update))
-    try:
-        return await make_request(bot, method)
-    except TelegramBadRequest as e:
-        _CUSTOM_EMOJI_REJECTED = True
-        log.warning("Telegram отклонил кастомный эмодзи (%s), отправляю с обычным 🪙", e)
-        return await make_request(bot, method.model_copy(update=update))
+
+    def variant(strip_text: bool, strip_icons: bool):
+        update = {}
+        if strip_text and text_update:
+            update.update(text_update)
+        if strip_icons and has_icons:
+            update["reply_markup"] = strip_button_icons(markup)
+        return method.model_copy(update=update) if update else method
+
+    force_text = _CUSTOM_EMOJI_REJECTED and bool(text_update)
+    force_icons = _BUTTON_ICON_REJECTED and has_icons
+    # Порядок попыток: как есть → без иконок → без tg-emoji → без обоих.
+    attempts = []
+    for st, si in ((False, False), (False, True), (True, False), (True, True)):
+        st, si = st or force_text, si or force_icons
+        if (st and not text_update) or (si and not has_icons):
+            continue
+        if (st, si) not in attempts:
+            attempts.append((st, si))
+    last_error = None
+    for st, si in attempts:
+        try:
+            result = await make_request(bot, variant(st, si))
+        except TelegramBadRequest as e:
+            last_error = e
+            continue
+        if last_error is not None:
+            if st and not _CUSTOM_EMOJI_REJECTED:
+                _CUSTOM_EMOJI_REJECTED = True
+                log.warning("Telegram отклонил кастомный эмодзи (%s), дальше обычный 🪙", last_error)
+            if si and not _BUTTON_ICON_REJECTED:
+                _BUTTON_ICON_REJECTED = True
+                log.warning("Telegram отклонил иконку на кнопке (%s), дальше кнопки без неё",
+                            last_error)
+        return result
+    raise last_error
 
 
 _EMOJI_FIELDS = ("text", "caption")
@@ -1383,10 +1435,21 @@ def menu_kb(is_admin_user: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def dzo_button(text: str, callback_data: str) -> InlineKeyboardButton:
+    """ Кнопка с ценой в DZO: перед текстом золотая монета (кастомный эмодзи
+        через icon_custom_emoji_id), в самом тексте символа монеты нет.
+        Если Telegram откажет в иконке, emoji_fallback_middleware повторит
+        отправку без неё. """
+    return InlineKeyboardButton(
+        text=text, callback_data=callback_data,
+        icon_custom_emoji_id=DZO_EMOJI_ID if USE_CUSTOM_EMOJI else None,
+    )
+
+
 def withdraw_kb(user_id: int) -> InlineKeyboardMarkup:
     """ Кнопка «ВЫВОД ДЗО» под результатом фарма (нажать может только этот участник). """
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="ВЫВОД ДЗО", callback_data=f"wd:{user_id}")
+        dzo_button("ВЫВОД ДЗО", f"wd:{user_id}")
     ]])
 
 
@@ -1407,9 +1470,8 @@ def back_kb() -> InlineKeyboardMarkup:
 def shop_kb(chat_id: int, with_back: bool = False) -> InlineKeyboardMarkup:
     rows = []
     for key, item in SHOP_ITEMS.items():
-        rows.append([InlineKeyboardButton(
-            text=f"{item['emoji']} {item['name']} — {get_price(chat_id, key)} {DZO_EMOJI_PLAIN}",
-            callback_data=f"buy:{key}",
+        rows.append([dzo_button(
+            f"{item['name']} — {get_price(chat_id, key)} {CURRENCY}", f"buy:{key}",
         )])
     if with_back:
         rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
@@ -1430,19 +1492,17 @@ def shop_text(chat_id: int) -> str:
 def fishshop_kb(chat_id: int, user_id: int, with_back: bool = False) -> InlineKeyboardMarkup:
     rows = []
     for key, g in GEAR.items():
-        rows.append([InlineKeyboardButton(
-            text=f"{g['emoji']} {g['name']} — {get_price(chat_id, key)} {DZO_EMOJI_PLAIN}",
-            callback_data=f"buy:{key}",
+        rows.append([dzo_button(
+            f"{g['name']} — {get_price(chat_id, key)} {CURRENCY}", f"buy:{key}",
         )])
     # Продажа своего улова: показываем только то, что реально есть.
     inv = get_inventory(chat_id, user_id)
     for key, f in FISH.items():
         qty = inv.get(key, 0)
         if qty > 0 and f["price"] is not None and get_price(chat_id, key) > 0:
-            rows.append([InlineKeyboardButton(
-                text=f"{f['emoji']} Продать {f['name']} ×{qty} — "
-                     f"{get_price(chat_id, key)} {DZO_EMOJI_PLAIN}/шт",
-                callback_data=f"sell:{key}",
+            rows.append([dzo_button(
+                f"Продать {f['name']} ×{qty} — {get_price(chat_id, key)} {CURRENCY}/шт",
+                f"sell:{key}",
             )])
     if with_back:
         rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
@@ -1476,10 +1536,9 @@ def business_kb(chat_id: int, with_back: bool = False) -> InlineKeyboardMarkup:
     for key, b in BUSINESSES.items():
         if get_business(chat_id, key):
             continue  # занят — купить нельзя
-        rows.append([InlineKeyboardButton(
-            text=f"{b['emoji']} Купить {b['name']} — "
-                 f"{get_price(chat_id, 'biz_' + key)} {DZO_EMOJI_PLAIN}",
-            callback_data=f"bizbuy:{key}",
+        rows.append([dzo_button(
+            f"Купить {b['name']} — {get_price(chat_id, 'biz_' + key)} {CURRENCY}",
+            f"bizbuy:{key}",
         )])
     if with_back:
         rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
