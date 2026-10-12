@@ -1344,21 +1344,22 @@ class Broadcaster:
 # Регистрация хендлеров
 # ----------------------------------------------------------------------------
 CMD_PREFIX = "!"
-_BANG_RE = re.compile(r"^!\s*")
+_BANG_RE = re.compile(r"^\s*!\s*")
 
 
 def split_bang(message: Message):
-    """ Если сообщение начинается с «!», возвращает его копию без «!» (и пробелов
-        после него), со сдвинутыми сущностями (@упоминания, ссылки). Иначе None.
+    """ Если сообщение начинается с «!» (пробелы и переносы перед ним допускаются,
+        как у первого бота группы), возвращает его копию без «!» (и пробелов после
+        него), со сдвинутыми сущностями (@упоминания, ссылки). Иначе None.
         Копия остаётся привязанной к боту, так что message.reply/answer работают. """
     text = message.text
-    if not text or not text.startswith(CMD_PREFIX):
+    if not text or not text.lstrip().startswith(CMD_PREFIX):
         return None
     cut = _BANG_RE.match(text).end()
     rest = text[cut:]
     if not rest.strip():
         return None
-    # «!» и пробелы — символы BMP, в UTF-16 это ровно cut единиц.
+    # «!» и пробельные символы — символы BMP, в UTF-16 это ровно cut единиц.
     new_entities = None
     if message.entities:
         new_entities = []
@@ -1407,6 +1408,50 @@ def cmd_filter(*words, no_bang=()):
         return bool(free and free.match(text.strip()))
 
     return check
+
+
+# Рассылка этого бота управляется только командами «!реклама фарм ...»
+# («!реклама фарм дзо ...», «фарм-дзо», «фармдзо» тоже). Обычные «!реклама текст ...»
+# и «!реклама грин маркет ...» принадлежат первому боту группы (рассылки), этот бот
+# на них молчит, чтобы на одну команду не отвечали два бота.
+AD_FARM_RE = re.compile(r"(?i)^(?:реклама|рассылка)\s+фарм(?:\s*-?\s*(?:дзо|dzo))?(?=\s|$)")
+
+
+# Любое слово, начинающееся с «фарм», первый бот считает чужим и молчит
+# («!реклама фарм, стоп», «!реклама фармер»). Если такая команда не разобрана
+# AD_FARM_RE, этот бот отвечает справкой, чтобы ответил ровно один бот.
+AD_FARM_LOOSE_RE = re.compile(r"(?i)^(?:реклама|рассылка)\s+фарм\S*")
+_AD_ANY_RE = re.compile(r"(?i)^(?:реклама|рассылка)(?:\s|$)")
+_AD_CAPTION_RE = re.compile(r"^\s*!\s*")
+
+
+def ad_caption_command(message: Message):
+    """ Подпись к фото вида «!реклама фарм ...»: возвращает совпадение AD_FARM_RE
+        (или AD_FARM_LOOSE_RE) по подписи без «!» и саму подпись без «!», иначе None. """
+    caption = message.caption
+    if not caption or not message.photo:
+        return None
+    bang = _AD_CAPTION_RE.match(caption)
+    if not bang or not caption[bang.end():].strip():
+        return None
+    body = caption[bang.end():]
+    if not AD_FARM_LOOSE_RE.match(body):
+        return None
+    return AD_FARM_RE.match(body), body
+
+
+def not_ad_command(message: Message, bang: bool = False) -> bool:
+    """ Фильтр для диалога после покупки: команды «!реклама ...» / «!рассылка ...»
+        (и фото с такой подписью) в него не попадают. «!реклама фарм ...» уходит
+        в обработчики рекламы этого бота, остальные «!реклама ...» принадлежат
+        первому боту группы, здесь молчим. """
+    if bang and message.text and _AD_ANY_RE.match(message.text):
+        return False
+    caption = message.caption or ""
+    bang_cap = _AD_CAPTION_RE.match(caption)
+    if bang_cap and _AD_ANY_RE.match(caption[bang_cap.end():]):
+        return False
+    return True
 
 
 def matched_word(text: str, words) -> str:
@@ -1767,7 +1812,8 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
             await notify_owner(cb.message, buyer, item)
 
     # ----- Ожидание данных после покупки (высший приоритет) -----
-    @dp.message(F.func(lambda m: bool(m.from_user) and (m.chat.id, m.from_user.id) in PENDING))
+    @dp.message(F.func(lambda m: bool(m.from_user) and (m.chat.id, m.from_user.id) in PENDING),
+                not_ad_command)
     async def pending_cmd(message: Message, raw_text: str | None = None):
         key = (message.chat.id, message.from_user.id)
         state = PENDING.get(key)
@@ -3108,24 +3154,31 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
     # ----- РЕКЛАМА (управление рассылкой) -----
     @dp.message(cmd_filter("реклама", "рассылка"))
     async def ad_cmd(message: Message):
+        farm = AD_FARM_RE.match(message.text)
+        if not farm:
+            if AD_FARM_LOOSE_RE.match(message.text) and await guard(message):
+                await message.reply(AD_HELP)  # «!реклама фарм, стоп» и т.п.
+            return  # иначе команда первого бота группы (см. AD_FARM_RE), молчим
         if not await guard(message):
             return
-        word = matched_word(message.text, ["рассылка", "реклама"])
-        rest = message.text[len(word):].strip()
+        rest = message.text[farm.end():].strip()
         low = rest.lower()
+        # подкоманда сравнивается целым словом («текстовая», «стопка» не команды)
+        sub_m = re.match(r"\w+", low)
+        sub = sub_m.group(0) if sub_m else ""
         s = bc.settings
 
-        if low.startswith("текст"):
+        if sub == "текст":
             new_text = rest[len("текст"):].strip()
             if not new_text:
-                await message.reply("Укажите текст: <code>!реклама текст Ваше объявление</code>")
+                await message.reply("Укажите текст: <code>!реклама фарм текст Ваше объявление</code>")
                 return
             s["text"] = new_text
             bc.save()
             await message.reply("✅ Текст рекламы сохранён.")
 
-        elif low.startswith("фото") or low.startswith("картинка"):
-            word_p = "фото" if low.startswith("фото") else "картинка"
+        elif sub in ("фото", "картинка"):
+            word_p = sub
             arg = rest[len(word_p):].strip().lower()
             if arg in ("удалить", "убрать", "нет", "-"):
                 s["photo"] = None
@@ -3137,19 +3190,19 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
                 photo = message.reply_to_message.photo[-1].file_id
             if not photo:
                 await message.reply(
-                    "Ответьте командой <code>!реклама фото</code> на сообщение с картинкой.\n"
-                    "Убрать картинку: <code>!реклама фото удалить</code>"
+                    "Ответьте командой <code>!реклама фарм фото</code> на сообщение с картинкой.\n"
+                    "Убрать картинку: <code>!реклама фарм фото удалить</code>"
                 )
                 return
             s["photo"] = photo
             bc.save()
             await message.reply("🖼 Картинка сохранена — теперь реклама уходит вместе с ней.")
 
-        elif low.startswith("интервал"):
+        elif sub == "интервал":
             arg = rest[len("интервал"):].strip()
             seconds = parse_duration(arg)
             if not seconds:
-                await message.reply("Укажите интервал: <code>!реклама интервал 2ч</code> (с/м/ч/д)")
+                await message.reply("Укажите интервал: <code>!реклама фарм интервал 2ч</code> (с/м/ч/д)")
                 return
             s["interval_seconds"] = seconds
             bc.save()
@@ -3157,9 +3210,9 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
                 bc.start()  # перезапуск с новым интервалом
             await message.reply(f"✅ Интервал рассылки: каждые {human_duration(seconds)}.")
 
-        elif low.startswith("старт") or low.startswith("вкл"):
+        elif sub in ("старт", "вкл"):
             if not s.get("text"):
-                await message.reply("Сначала задайте текст: <code>!реклама текст ...</code>")
+                await message.reply("Сначала задайте текст: <code>!реклама фарм текст ...</code>")
                 return
             s["chat_id"] = message.chat.id
             bc.start()
@@ -3167,11 +3220,11 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
                 f"🚀 Рассылка запущена в этой группе.\nИнтервал: {human_duration(s['interval_seconds'])}."
             )
 
-        elif low.startswith("стоп") or low.startswith("выкл"):
+        elif sub in ("стоп", "выкл"):
             bc.disable()
             await message.reply("🛑 Рассылка остановлена.")
 
-        elif low.startswith("статус"):
+        elif sub == "статус":
             state = "включена ✅" if s.get("enabled") else "выключена ❌"
             preview = (s.get("text") or "—")
             if len(preview) > 200:
@@ -3184,11 +3237,37 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
                 f"Текст:\n{preview}"
             )
 
-        elif low.startswith("отправить") or low.startswith("сейчас"):
+        elif sub in ("отправить", "сейчас"):
             if s.get("text") or s.get("photo"):
                 await bc.send_to(message.chat.id)
             else:
                 await message.reply("Реклама не задана (нет ни текста, ни картинки).")
+        else:
+            await message.reply(AD_HELP)
+
+    # ----- РЕКЛАМА: фото с подписью «!реклама фарм текст ...» / «!реклама фарм фото» -----
+    @dp.message(F.photo, F.func(lambda m: ad_caption_command(m) is not None))
+    async def ad_photo_caption_cmd(message: Message):
+        farm, body = ad_caption_command(message)
+        if not await guard(message):
+            return
+        rest = body[farm.end():].strip() if farm else ""
+        low = rest.lower()
+        sub_m = re.match(r"\w+", low)
+        sub = sub_m.group(0) if sub_m else ""
+        s = bc.settings
+        if farm and sub == "текст":
+            s["photo"] = message.photo[-1].file_id
+            new_text = rest[len("текст"):].strip()
+            if new_text:
+                s["text"] = new_text
+            bc.save()
+            await message.reply("🖼 Картинка и текст рекламы сохранены." if new_text
+                                else "🖼 Картинка сохранена, текст рекламы прежний.")
+        elif farm and sub in ("фото", "картинка") and not rest[len(sub):].strip():
+            s["photo"] = message.photo[-1].file_id
+            bc.save()
+            await message.reply("🖼 Картинка сохранена — теперь реклама уходит вместе с ней.")
         else:
             await message.reply(AD_HELP)
 
@@ -3239,13 +3318,13 @@ HELP_TEXT = (
     "• <code>!варны</code> — сколько предупреждений\n"
     "• <code>!инфо</code> — данные пользователя\n\n"
     + "<b>📣 Рассылка рекламы:</b>\n" + (
-        "• <code>!реклама текст ...</code> — задать текст\n"
-        "• <code>!реклама фото</code> — ответом на картинку (задать картинку)\n"
-        "• <code>!реклама фото удалить</code> — убрать картинку\n"
-        "• <code>!реклама интервал 2ч</code> — задать интервал\n"
-        "• <code>!реклама старт</code> / <code>!реклама стоп</code>\n"
-        "• <code>!реклама статус</code> — текущие настройки\n"
-        "• <code>!реклама отправить</code> — отправить сейчас\n"
+        "• <code>!реклама фарм текст ...</code> — задать текст\n"
+        "• <code>!реклама фарм фото</code> — ответом на картинку (задать картинку)\n"
+        "• <code>!реклама фарм фото удалить</code> — убрать картинку\n"
+        "• <code>!реклама фарм интервал 2ч</code> — задать интервал\n"
+        "• <code>!реклама фарм старт</code> / <code>!реклама фарм стоп</code>\n"
+        "• <code>!реклама фарм статус</code> — текущие настройки\n"
+        "• <code>!реклама фарм отправить</code> — отправить сейчас\n"
     )
 )
 
@@ -3340,13 +3419,13 @@ INSTRUCTION_TEXT = (
 
 AD_HELP = (
     "📣 <b>Управление рассылкой:</b>\n"
-    "• <code>!реклама текст ...</code>\n"
-    "• <code>!реклама фото</code> — ответом на картинку\n"
-    "• <code>!реклама фото удалить</code>\n"
-    "• <code>!реклама интервал 2ч</code>\n"
-    "• <code>!реклама старт</code> / <code>!реклама стоп</code>\n"
-    "• <code>!реклама статус</code>\n"
-    "• <code>!реклама отправить</code> — прямо сейчас"
+    "• <code>!реклама фарм текст ...</code>\n"
+    "• <code>!реклама фарм фото</code> — ответом на картинку\n"
+    "• <code>!реклама фарм фото удалить</code>\n"
+    "• <code>!реклама фарм интервал 2ч</code>\n"
+    "• <code>!реклама фарм старт</code> / <code>!реклама фарм стоп</code>\n"
+    "• <code>!реклама фарм статус</code>\n"
+    "• <code>!реклама фарм отправить</code> — прямо сейчас"
 )
 
 # ----------------------------------------------------------------------------
