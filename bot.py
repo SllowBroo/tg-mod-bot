@@ -44,20 +44,30 @@ WARNS_TO_BAN = 3  # сколько предупреждений до автоб�
 # Экономика DZO
 # ----------------------------------------------------------------------------
 # Иконка валюты. В сообщениях (parse_mode=HTML) идёт кастомный эмодзи монеты
-# из набора DzoFun, в кнопках и всплывающих окнах (там HTML не работает) идёт
-# обычный эмодзи. Вернуть обычный эмодзи везде: USE_CUSTOM_EMOJI = False.
+# из набора DzoFun, на кнопках с ценой та же монета иконкой. Где кастомный
+# эмодзи невозможен (всплывающие окна, кнопки без иконки, запасной путь при
+# отказе Telegram), идёт жёлтый кружок 🟡: обычная 🪙 на телефонах серая.
+# Вернуть обычный эмодзи везде: USE_CUSTOM_EMOJI = False.
 USE_CUSTOM_EMOJI = True
 DZO_EMOJI_ID = "5377350967861748561"
-DZO_EMOJI_PLAIN = "🪙"
+DZO_EMOJI_PLAIN = "🟡"
+# Замещающий символ внутри <tg-emoji> (его видно только там, где Telegram
+# не рисует кастомный эмодзи, например в тексте уведомления). Оставлен тем же,
+# с которым Telegram принимает эту монету с 11.10.
+DZO_EMOJI_ALT = "🪙"
 DZO_EMOJI = (
-    f'<tg-emoji emoji-id="{DZO_EMOJI_ID}">{DZO_EMOJI_PLAIN}</tg-emoji>'
+    f'<tg-emoji emoji-id="{DZO_EMOJI_ID}">{DZO_EMOJI_ALT}</tg-emoji>'
     if USE_CUSTOM_EMOJI else DZO_EMOJI_PLAIN
 )
 CURRENCY = "DZO"             # название валюты в текстах
 FARM_COOLDOWN = 4 * 3600     # фарм доступен раз в 4 часа
 FARM_MIN, FARM_MAX = 1, 3    # диапазон выпадения DZO (равные шансы)
-WITHDRAW_MIN = 1000          # с какого баланса доступна кнопка «ВЫВОД ДЗО»
+WITHDRAW_MIN = 1000          # с какого баланса можно вывести DZO (кнопка «ВЫВОД ДЗО» видна всегда)
 TOP_LIMIT = 200              # сколько участников показывает «!топ»
+TOP_CUSTOM_EMOJI_ROWS = 25   # в стольких первых строках топа золотая монета (кастомный эмодзи)
+# Telegram учитывает не больше 100 сущностей разметки на сообщение (ссылка,
+# жирный, кастомный эмодзи — каждая отдельно). Топ режется на сообщения с запасом.
+TOP_ENTITY_BUDGET = 90
 WITHDRAW_RETRY_EVERY = 5 * 60        # как часто досылать недоставленные заявки на вывод
 WITHDRAW_UNDELIVERED_TTL = 24 * 3600  # через сколько недоставленная заявка отклоняется с возвратом
 # dzo_withdrawals.delivered: 0 не доставлена, 1 доставлена владельцу,
@@ -95,7 +105,7 @@ SHOP_ITEMS = {
     "tag":     {"name": "Тег",                  "price": 300,   "kind": "tag",
                 "emoji": "🏷", "desc": "Личный титул, который виден рядом с вашим именем."},
     "dzo":     {"name": "100 DZO",              "price": 1000,  "kind": "manual",
-                "emoji": "🪙", "desc": "Внутренняя валюта/ресурс — выдаёт владелец."},
+                "emoji": DZO_EMOJI, "desc": "Внутренняя валюта/ресурс — выдаёт владелец."},
     "mod":     {"name": "Модератор",            "price": 10000, "kind": "manual",
                 "emoji": "🛡", "desc": "Выдача прав модератора — решает владелец."},
     "ad":      {"name": "Реклама клана (сутки)", "price": 3000, "kind": "manual",
@@ -557,6 +567,39 @@ def set_invite_bonus(chat_id: int, value: int) -> None:
             (chat_id, value),
         )
         conn.commit()
+
+
+def take_balance(chat_id: int, user_id: int, amount, user=None):
+    """ Списывает amount DZO (команда «!забрать»), баланс не уходит ниже нуля.
+        amount=None — забрать всё. Одной транзакцией. Возвращает (сколько
+        реально списано, новый баланс). Замороженные в заявках на вывод суммы
+        не затрагиваются: они уже не на балансе. """
+    name = getattr(user, "full_name", None) if user else None
+    username = getattr(user, "username", None) if user else None
+    with closing(sqlite3.connect(DB_PATH, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT balance FROM cp_balances WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            ).fetchone()
+            bal = row[0] if row and row[0] else 0
+            if amount is None:          # всё, как «!обнулить»
+                taken, new_bal = max(0, bal), 0
+            else:
+                taken = max(0, min(int(amount), bal))
+                new_bal = bal - taken
+            if row:
+                conn.execute(
+                    "UPDATE cp_balances SET balance=?, name=COALESCE(?, name), "
+                    "username=COALESCE(?, username) WHERE chat_id=? AND user_id=?",
+                    (new_bal, name, username, chat_id, user_id),
+                )
+            conn.execute("COMMIT")
+            return taken, new_bal
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def set_balance(chat_id: int, user_id: int, amount: int, user=None) -> None:
@@ -1040,13 +1083,19 @@ async def is_owner(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 # ---- Запасной путь для кастомного эмодзи ------------------------------------
-_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', re.S)
+_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="(\d+)">(.*?)</tg-emoji>', re.S)
 _CUSTOM_EMOJI_REJECTED = False   # Telegram уже отклонял кастомный эмодзи этого бота
 
 
 def plain_emoji_text(text):
-    """ Тот же текст, но вместо <tg-emoji ...>🪙</tg-emoji> обычный 🪙. """
-    return _TG_EMOJI_RE.sub(r"\1", text) if text else text
+    """ Тот же текст, но вместо <tg-emoji ...>🪙</tg-emoji> жёлтый 🟡
+        (обычная 🪙 на телефонах серая). """
+    if not text:
+        return text
+    # Чужие кастомные эмодзи (например, в тексте рекламы от админа) заменяются
+    # своим замещающим символом, монета DZO заменяется на 🟡.
+    return _TG_EMOJI_RE.sub(
+        lambda m: DZO_EMOJI_PLAIN if m.group(1) == DZO_EMOJI_ID else m.group(2), text)
 
 
 _BUTTON_ICON_REJECTED = False   # Telegram уже отклонял иконку на кнопке
@@ -1058,12 +1107,21 @@ def _markup_has_icons(markup) -> bool:
     )
 
 
+def _plain_coin_button(b):
+    """ Кнопка без иконки: монета жёлтым 🟡 в начале текста. """
+    if not getattr(b, "icon_custom_emoji_id", None):
+        return b
+    return b.model_copy(update={"icon_custom_emoji_id": None,
+                                "text": f"{DZO_EMOJI_PLAIN} {b.text}"})
+
+
 def strip_button_icons(markup):
-    """ Та же клавиатура, но без icon_custom_emoji_id на кнопках. """
+    """ Та же клавиатура, но без icon_custom_emoji_id на кнопках
+        (вместо иконки в текст кнопки ставится 🟡). """
     if not _markup_has_icons(markup):
         return markup
     return InlineKeyboardMarkup(inline_keyboard=[
-        [b.model_copy(update={"icon_custom_emoji_id": None}) for b in row]
+        [_plain_coin_button(b) for b in row]
         for row in markup.inline_keyboard
     ])
 
@@ -1074,7 +1132,7 @@ async def emoji_fallback_middleware(make_request, bot, method):
            (sendPhoto, editMessageCaption и др.), включая рекламу;
         2) иконка icon_custom_emoji_id на inline-кнопках с ценой.
         Если Telegram отклонил запрос (TelegramBadRequest), он повторяется
-        сначала без иконок на кнопках, потом с обычным 🪙 в тексте, потом без
+        сначала без иконок на кнопках, потом с жёлтым 🟡 в тексте, потом без
         того и другого. Что именно пришлось убрать, запоминается до перезапуска,
         и дальше это убирается сразу, без лишних запросов. Повторяется только
         отправка: начисления, кулдауны и заморозки уже записаны и второй раз
@@ -1118,7 +1176,8 @@ async def emoji_fallback_middleware(make_request, bot, method):
         if last_error is not None:
             if st and not _CUSTOM_EMOJI_REJECTED:
                 _CUSTOM_EMOJI_REJECTED = True
-                log.warning("Telegram отклонил кастомный эмодзи (%s), дальше обычный 🪙", last_error)
+                log.warning("Telegram отклонил кастомный эмодзи (%s), дальше обычный %s",
+                            last_error, DZO_EMOJI_PLAIN)
             if si and not _BUTTON_ICON_REJECTED:
                 _BUTTON_ICON_REJECTED = True
                 log.warning("Telegram отклонил иконку на кнопке (%s), дальше кнопки без неё",
@@ -1150,8 +1209,68 @@ def cp(amount) -> str:
 
 
 def cp_plain(amount) -> str:
-    """ Формат суммы для кнопок и всплывающих окон (без HTML): «100 🪙 DZO». """
+    """ Формат суммы для всплывающих окон и мест без кастомного эмодзи
+        (без HTML): «100 🟡 DZO». """
     return f"{amount} {DZO_EMOJI_PLAIN} {CURRENCY}"
+
+
+# ---- Топ: строки и разбивка на сообщения -----------------------------------
+_TOP_MEDALS = ("🥇", "🥈", "🥉")
+# То, что Telegram сам превращает в сущности в обычном тексте (@ник, #тег, $тикер,
+# /команда, ссылка). Встречается только в титулах; считаем с запасом.
+_AUTO_ENTITY_RE = re.compile(
+    r"[@#$/]\w|https?://|\w\.[^\W\d_]{2,}"
+    r"|\+?\d[\d\-() ]{5,}\d"   # номер телефона / длинное число (Telegram может выделить)
+)
+
+
+def html_entity_count(html: str) -> int:
+    """ Сколько сущностей разметки Telegram насчитает в HTML-строке бота:
+        теги <a>, <b>, <i>, <code>, <tg-emoji> плюс автоссылки (@, #, $, /, домены)
+        в обычном тексте. Считает с запасом, точность не нужна. """
+    tags = len(re.findall(r"<(?:a|b|i|code|tg-emoji)[\s>]", html))
+    # Текст внутри ссылки уже входит в её сущность, автоссылкой не считается.
+    # Жирным у бота идут только суммы и заголовок, их не разбираем (иначе
+    # баланс от 1 000 000 считался бы номером телефона).
+    plain = re.sub(r"<a\s[^>]*>.*?</a>|<b>.*?</b>", " ", html, flags=re.S)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    return tags + len(_AUTO_ENTITY_RE.findall(plain))
+
+
+def top_line(i: int, uid: int, bal: int, name=None, username=None, title=None) -> str:
+    """ Строка «!топ». В первых TOP_CUSTOM_EMOJI_ROWS строках сумма с золотой
+        монетой (кастомный эмодзи, как в магазине), дальше с жёлтым 🟡:
+        кастомных эмодзи в одном сообщении Telegram учитывает ограниченно. """
+    tag = _TOP_MEDALS[i] if i < len(_TOP_MEDALS) else f"{i + 1}."
+    disp = esc(name or (f"@{username}" if username else None) or f"id{uid}")
+    link = f'<a href="tg://user?id={uid}">{disp}</a>'
+    if title:
+        link += f" [{esc(title)}]"
+    amount = cp(bal) if i < TOP_CUSTOM_EMOJI_ROWS else cp_plain(bal)
+    return f"{tag} {link} — <b>{amount}</b>"
+
+
+def top_header(shown: str) -> str:
+    return f"🏆 <b>Топ по {DZO_EMOJI} DZO</b> ({shown})"
+
+
+def top_chunks(header: str, lines, max_chars: int = 3800, max_entities: int = None):
+    """ Режет топ на сообщения: не больше max_chars символов (лимит Telegram 4096)
+        и не больше max_entities сущностей (лимит Telegram 100) в каждом. """
+    if max_entities is None:
+        max_entities = TOP_ENTITY_BUDGET
+    chunks = []
+    chunk, ents = header, html_entity_count(header)
+    for line in lines:
+        n = html_entity_count(line)
+        if chunk and (len(chunk) + len(line) + 1 > max_chars or ents + n > max_entities):
+            chunks.append(chunk)
+            chunk, ents = "", 0
+        chunk = f"{chunk}\n{line}" if chunk else line
+        ents += n
+    if chunk:
+        chunks.append(chunk)
+    return chunks
 
 
 def match_key(text: str, aliases: dict):
@@ -1193,6 +1312,134 @@ def extract_amount(text: str):
     clean = re.sub(r"tg://\S+", " ", clean)
     nums = re.findall(r"\d+", clean)
     return int(nums[-1]) if nums else None
+
+
+def _utf16_to_index(text: str, offset: int) -> int:
+    """ Смещение Telegram (в UTF-16) → индекс символа в строке Python. """
+    units = 0
+    for i, ch in enumerate(text):
+        if units >= offset:
+            return i
+        units += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
+TAKE_FORMAT = ("Формат: <code>!забрать @ник 500</code> (или ответом на сообщение "
+               "<code>!забрать 500</code>). Без суммы забираются все DZO.")
+_TAKE_WORD_RE = re.compile(r"(?i)^забрать(?=\s|$)")
+_TG_USER_RE = re.compile(r"^tg://user\?id=(\d+)$")
+
+
+async def _member_user(message: Message, user_id: int):
+    """ Участник чата по ID; вышедших и исключённых не считаем участниками. """
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, user_id)
+    except TelegramAPIError:
+        return None
+    if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        return None
+    if getattr(member, "is_member", True) is False:   # ограниченный, но уже вышел
+        return None
+    return member.user
+
+
+def _real_reply(message: Message):
+    """ Сообщение, на которое ответили, или None. В форум-группе Telegram кладёт
+        в reply_to_message служебное сообщение о создании темы: это не ответ. """
+    reply = message.reply_to_message
+    if not reply:
+        return None
+    if getattr(reply, "forum_topic_created", None):
+        return None
+    if getattr(message, "is_topic_message", None) and \
+            reply.message_id == getattr(message, "message_thread_id", None):
+        return None
+    return reply
+
+
+async def parse_take(message: Message):
+    """ Разбор «!забрать»: возвращает (цель, сумма, ошибка).
+        Цель: ответ на сообщение, скрытое упоминание (text_mention), @ник,
+        ссылка tg://user?id=, числовой ID. Сумма: одно целое число больше нуля
+        или ничего (None — забрать всё). Всё остальное (лишние слова, «-500»,
+        «10.5», «abc», неизвестный @ник) — ошибка, баланс не трогается. """
+    text = message.text or ""
+    m = _TAKE_WORD_RE.match(text)
+    if not m:
+        return None, None, TAKE_FORMAT
+    body = text[m.end():]
+    target = None
+    # скрытое упоминание: вырезаем ровно его участок текста
+    mentions = []
+    for ent in message.entities or []:
+        if ent.type == "text_mention" and ent.user:
+            start = _utf16_to_index(text, ent.offset)
+            end = _utf16_to_index(text, ent.offset + ent.length)
+            if start >= m.end():
+                mentions.append((start, end, ent.user))
+    if len(mentions) > 1:
+        return None, None, TAKE_FORMAT   # несколько целей сразу
+    if mentions:
+        start, end, target = mentions[0]
+        body = text[m.end():start] + " " + text[end:]
+    reply = _real_reply(message)
+    if reply:
+        if target is not None:
+            return None, None, TAKE_FORMAT
+        if reply.sender_chat or not reply.from_user or reply.from_user.is_bot:
+            return None, None, ("Ответьте командой на сообщение самого участника "
+                                "(не бота и не канала) или укажите @ник.")
+        target = reply.from_user
+    tokens = body.split()
+    nums = []
+    for tok in tokens:
+        if tok.startswith("@"):
+            if target is not None or not re.fullmatch(r"@[A-Za-z0-9_]{4,32}", tok):
+                return None, None, TAKE_FORMAT
+            uname = tok[1:]
+            row = find_user_by_username(message.chat.id, uname)
+            if row:
+                # Ник в базе мог устареть (участник сменил его, ник занял другой):
+                # перед списанием сверяем с Telegram, что ник сейчас у этого ID.
+                target = await _member_user(message, row[0])
+                if target is None or (target.username or "").lower() != uname.lower():
+                    return None, None, (f"Не уверен, кто сейчас {esc(tok)}: ник мог смениться. "
+                                        "Ответьте командой на сообщение участника.")
+            else:
+                try:
+                    target = await message.bot.get_chat("@" + uname)
+                except Exception:  # noqa: BLE001 — ник может не находиться
+                    target = None
+                # @ник канала или группы — не участник; человек должен быть в этом чате
+                if target is not None and getattr(target, "type", None) == "private":
+                    target = await _member_user(message, target.id)
+                else:
+                    target = None
+                if target is None:
+                    return None, None, f"Не нашёл {esc(tok)} в чате. Ответьте командой на его сообщение."
+        elif _TG_USER_RE.match(tok):
+            if target is not None:
+                return None, None, TAKE_FORMAT
+            target = await _member_user(message, int(_TG_USER_RE.match(tok).group(1)))
+            if target is None:
+                return None, None, "Не нашёл этого участника в чате."
+        elif tok.isdigit() and tok.isascii():
+            nums.append(int(tok))
+        else:
+            return None, None, TAKE_FORMAT
+    if target is None:
+        # без явной цели первое число — ID участника, второе (если есть) — сумма
+        if not nums or len(nums) > 2 or nums[0] < 10_000:
+            return None, None, TAKE_FORMAT
+        target = await _member_user(message, nums.pop(0))
+        if target is None:
+            return None, None, "Не нашёл этого участника в чате."
+    if len(nums) > 1:
+        return None, None, TAKE_FORMAT
+    amount = nums[0] if nums else None
+    if amount == 0:
+        return None, None, "Сумма должна быть больше нуля. " + TAKE_FORMAT
+    return target, amount, None
 
 
 async def resolve_target(message: Message, numeric: bool = False):
@@ -1447,6 +1694,9 @@ def not_ad_command(message: Message, bang: bool = False) -> bool:
         первому боту группы, здесь молчим. """
     if bang and message.text and _AD_ANY_RE.match(message.text):
         return False
+    # «!забрать» владельца тоже не ответ в диалоге покупки (не титул, не закреп, не мут)
+    if bang and message.text and _TAKE_WORD_RE.match(message.text):
+        return False
     caption = message.caption or ""
     bang_cap = _AD_CAPTION_RE.match(caption)
     if bang_cap and _AD_ANY_RE.match(caption[bang_cap.end():]):
@@ -1484,15 +1734,17 @@ def dzo_button(text: str, callback_data: str) -> InlineKeyboardButton:
     """ Кнопка с ценой в DZO: перед текстом золотая монета (кастомный эмодзи
         через icon_custom_emoji_id), в самом тексте символа монеты нет.
         Если Telegram откажет в иконке, emoji_fallback_middleware повторит
-        отправку без неё. """
+        отправку без неё, поставив в начало текста 🟡. """
+    if not USE_CUSTOM_EMOJI:
+        return InlineKeyboardButton(text=f"{DZO_EMOJI_PLAIN} {text}", callback_data=callback_data)
     return InlineKeyboardButton(
-        text=text, callback_data=callback_data,
-        icon_custom_emoji_id=DZO_EMOJI_ID if USE_CUSTOM_EMOJI else None,
+        text=text, callback_data=callback_data, icon_custom_emoji_id=DZO_EMOJI_ID,
     )
 
 
 def withdraw_kb(user_id: int) -> InlineKeyboardMarkup:
-    """ Кнопка «ВЫВОД ДЗО» под результатом фарма (нажать может только этот участник). """
+    """ Кнопка «ВЫВОД ДЗО» под результатом фарма и под кошельком, видна всегда
+        (нажать может только этот участник; вывод возможен от WITHDRAW_MIN). """
     return InlineKeyboardMarkup(inline_keyboard=[[
         dzo_button("ВЫВОД ДЗО", f"wd:{user_id}")
     ]])
@@ -2045,7 +2297,8 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
         left = FARM_COOLDOWN - (now_ts() - last)
         if last and left > 0:
             await message.reply(
-                f"⏳ Рано! Следующий фарм через <b>{human_duration(left)}</b>."
+                f"⏳ Рано! Следующий фарм через <b>{human_duration(left)}</b>.",
+                reply_markup=withdraw_kb(user.id),
             )
             return
         amount = farm_amount()
@@ -2056,13 +2309,13 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
             f"Следующий фарм через {human_duration(FARM_COOLDOWN)}.\n"
             f"💰 Баланс: <b>{cp(bal)}</b>"
         )
-        markup = None
+        # Кнопка «ВЫВОД ДЗО» видна всегда; при балансе меньше WITHDRAW_MIN
+        # нажатие только показывает предупреждение (см. withdraw_cb).
         if bal >= WITHDRAW_MIN:
             text += "\n💸 Можно вывести DZO, нажмите кнопку ниже."
-            markup = withdraw_kb(user.id)
         else:
             text += f"\n🎯 До вывода осталось <b>{cp(WITHDRAW_MIN - bal)}</b>."
-        await message.reply(text, reply_markup=markup)
+        await message.reply(text, reply_markup=withdraw_kb(user.id))
 
     # ----- ВЫВОД DZO -----
     async def find_chat_owner(chat_id: int):
@@ -2230,11 +2483,12 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
                 await cb.answer(UNDELIVERED_ALERT, show_alert=True)
             return
         if status == "low":
+            # Ничего не списано и заявки нет. Кнопку не снимаем: она видна всегда,
+            # нажать снова можно, когда баланс дорастёт.
             await cb.answer(
                 f"Для вывода нужно от {cp_plain(WITHDRAW_MIN)}. У вас {cp_plain(amount)}.",
                 show_alert=True,
             )
-            await drop_button(msg)
             return
 
         # Заявка создана, сумма заморожена. Доставка отдельно: если она сорвётся,
@@ -2315,8 +2569,10 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
         user = message.from_user
         remember_user(message.chat.id, user)
         bal = get_balance(message.chat.id, user.id)
+        # Кнопка «ВЫВОД ДЗО» всегда (в группе; в личке вывод не работает).
         await message.reply(
-            f"💰 Кошелёк {titled(message.chat.id, user)}\nБаланс: <b>{cp(bal)}</b>"
+            f"💰 Кошелёк {titled(message.chat.id, user)}\nБаланс: <b>{cp(bal)}</b>",
+            reply_markup=withdraw_kb(user.id) if is_group(message) else None,
         )
 
     # ----- ТОП -----
@@ -2331,29 +2587,11 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
             return
         rows = all_rows[:TOP_LIMIT]
         titles = get_titles(message.chat.id)
-        medals = ["🥇", "🥈", "🥉"]
-        lines = []
-        for i, (uid, bal, name, username) in enumerate(rows):
-            tag = medals[i] if i < 3 else f"{i + 1}."
-            disp = esc(name or (f"@{username}" if username else None) or f"id{uid}")
-            link = f'<a href="tg://user?id={uid}">{disp}</a>'
-            title = titles.get(uid)
-            if title:
-                link += f" [{esc(title)}]"
-            # В строках топа обычный эмодзи: кастомных эмодзи в одном сообщении
-            # Telegram показывает ограниченное число, а строк может быть до 200.
-            lines.append(f"{tag} {link} — <b>{cp_plain(bal)}</b>")
-
-        # Шлём частями: в одно сообщение Telegram влезает не больше 4096 символов.
+        lines = [top_line(i, uid, bal, name, username, titles.get(uid))
+                 for i, (uid, bal, name, username) in enumerate(rows)]
         shown = (f"показано {len(rows)} из {len(all_rows)}"
                  if len(all_rows) > len(rows) else f"всего: {len(rows)}")
-        chunk = f"🏆 <b>Топ по {DZO_EMOJI} DZO</b> ({shown})"
-        for line in lines:
-            if len(chunk) + len(line) + 1 > 3800:
-                await message.answer(chunk)
-                chunk = ""
-            chunk = f"{chunk}\n{line}" if chunk else line
-        if chunk:
+        for chunk in top_chunks(top_header(shown), lines):
             await message.answer(chunk)
 
     # ----- ПЕРЕДАТЬ (P2P перевод) -----
@@ -2421,6 +2659,25 @@ def build_dispatcher(bot: Bot, cfg: dict) -> tuple[Dispatcher, Broadcaster]:
         bal = add_balance(message.chat.id, target.id, amount, target)
         await message.answer(
             f"👑 Владелец начислил <b>{cp(amount)}</b> пользователю {mention(target)}.\n"
+            f"💰 Баланс: <b>{cp(bal)}</b>"
+        )
+
+    # ----- ЗАБРАТЬ (владелец списывает DZO; без суммы забирает всё) -----
+    @dp.message(cmd_filter("забрать"))
+    async def take_cmd(message: Message):
+        if not is_group(message):
+            await message.reply("⚠️ Команда работает только в группе.")
+            return
+        if not await is_owner(bot, message.chat.id, message.from_user.id):
+            await message.reply("🚫 Команда доступна только владельцу чата.")
+            return
+        target, amount, error = await parse_take(message)
+        if error:
+            await message.reply(error)
+            return
+        taken, bal = take_balance(message.chat.id, target.id, amount, target)
+        await message.answer(
+            f"👑 Владелец забрал <b>{cp(taken)}</b> у {mention(target)}.\n"
             f"💰 Баланс: <b>{cp(bal)}</b>"
         )
 
@@ -3281,7 +3538,7 @@ HELP_TEXT = (
     "• <code>!меню</code> — главное меню с кнопками\n"
     f"• <code>Фарм</code> или <code>!фарм</code> — получить {FARM_MIN}–{FARM_MAX} DZO "
     f"(раз в {FARM_COOLDOWN // 3600} часа)\n"
-    f"• Кнопка «ВЫВОД ДЗО» — появляется после фарма, когда на балансе от {WITHDRAW_MIN} DZO\n"
+    f"• Кнопка «ВЫВОД ДЗО» — всегда под фармом и кошельком, вывести можно от {WITHDRAW_MIN} DZO\n"
     "• <code>!кошелёк</code> — показать баланс\n"
     "• <code>!пригласить</code> — персональная ссылка (+DZO за друга)\n"
     "• <code>!передать 100 @ник</code> — перевод (комиссия 20%)\n"
@@ -3304,6 +3561,7 @@ HELP_TEXT = (
     "• <code>!аукцион Рыболовный магазин</code> — начать торги (владелец)\n"
     "• <code>!отменить аукцион</code> — досрочно закрыть торги (владелец)\n"
     "• <code>!выдать @ник 50000</code> — начислить DZO (владелец)\n"
+    "• <code>!забрать @ник 500</code> — забрать DZO (владелец; без суммы забирает все)\n"
     "• <code>!обнулить @ник</code> — обнулить баланс\n"
     "• Заявки на вывод DZO приходят владельцу чата в личку с ботом "
     "(если личка закрыта, то в чат), решение кнопками «Вывод одобрен» / «Отклонить»\n\n"
@@ -3346,8 +3604,9 @@ def info_text(chat_id=None) -> str:
     "DZO это внутричатовая фарм валюта с последующим выводом. "
     "Её получают за фарм и тратят в магазине чата: закреп сообщений, мут шутников, "
     "покупка прав и даже реклама вашего клана. "
-    f"Когда на балансе наберётся {WITHDRAW_MIN} DZO и больше, под сообщением фарма "
-    "появится кнопка «ВЫВОД ДЗО», заявку на вывод рассматривает владелец чата.\n\n"
+    "Под сообщением фарма и кошелька есть кнопка «ВЫВОД ДЗО». Вывести можно, "
+    f"когда на балансе наберётся {WITHDRAW_MIN} DZO и больше, заявку на вывод "
+    "рассматривает владелец чата.\n\n"
     "💰 <b>Как заработать DZO?</b>\n"
     f"• Каждые {FARM_COOLDOWN // 3600} часа пишите «Фарм» и получайте "
     f"от {FARM_MIN} до {FARM_MAX} DZO (везение решает!).\n"
@@ -3385,7 +3644,7 @@ INSTRUCTION_TEXT = (
     f"<b>{DZO_EMOJI} DZO:</b>\n"
     f"• <code>Фарм</code> или <code>!фарм</code> — получить {FARM_MIN}–{FARM_MAX} DZO "
     f"(раз в {FARM_COOLDOWN // 3600} часа).\n"
-    f"• Кнопка «ВЫВОД ДЗО» — появляется под фармом, когда на балансе от {WITHDRAW_MIN} DZO. "
+    f"• Кнопка «ВЫВОД ДЗО» — под фармом и кошельком, вывести можно от {WITHDRAW_MIN} DZO. "
     "Вся сумма замораживается, владелец чата одобряет или отклоняет вывод.\n"
     "• <code>!кошелёк</code> или <code>!баланс</code> — показать баланс.\n"
     "• <code>!передать [сумма] @ник</code> — перевод с комиссией 20%.\n"
